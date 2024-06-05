@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter, Pointer};
 use crate::rejection::{InvalidMsgPackBody, MissingMsgPackContentType};
 use axum::{
     body::{Bytes, Body},
@@ -10,11 +12,31 @@ use axum::{
 };
 use hyper::header;
 use rejection::MsgPackRejection;
-use serde::{de::DeserializeOwned, Serialize};
 use std::ops::{Deref, DerefMut};
 
 mod error;
 mod rejection;
+
+#[cfg(feature = "msgpacker")]
+#[derive(Debug)]
+pub enum SafeError {
+    InvalidMessagePack
+}
+
+#[cfg(feature = "msgpacker")]
+impl Display for SafeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cannot parse msgpack")
+    }
+}
+
+#[cfg(feature = "msgpacker")]
+impl Error for SafeError { }
+
+#[cfg(feature = "msgpacker")]
+fn wrap_error<T, E>(error: Result<T, E>) -> Result<T, Box<SafeError>> {
+    error.map_err(|_| Box::new(SafeError::InvalidMessagePack))
+}
 
 /// MessagePack Extractor / Response.
 ///
@@ -93,10 +115,11 @@ mod rejection;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MsgPack<T>(pub T);
 
+#[cfg(feature = "rmp_serde")]
 #[async_trait]
 impl<T, S> FromRequest<S> for MsgPack<T>
 where
-    T: DeserializeOwned,
+    T: serde::de::DeserializeOwned,
     S: Send + Sync,
 {
     type Rejection = MsgPackRejection;
@@ -108,6 +131,25 @@ where
         let bytes = Bytes::from_request(req, state).await?;
         let value = rmp_serde::from_slice(&bytes).map_err(InvalidMsgPackBody::from_err)?;
         Ok(MsgPack(value))
+    }
+}
+
+#[cfg(feature = "msgpacker")]
+#[async_trait]
+impl<T, S> FromRequest<S> for MsgPack<T>
+    where
+        T: msgpacker::Unpackable,
+        S: Send + Sync,
+{
+    type Rejection = MsgPackRejection;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        if !message_pack_content_type(&req) {
+            return Err(MissingMsgPackContentType.into())
+        }
+        let bytes = Bytes::from_request(req, state).await?;
+        let value = wrap_error(T::unpack(&bytes)).map_err(InvalidMsgPackBody::from_err)?;
+        Ok(MsgPack(value.1))
     }
 }
 
@@ -131,9 +173,10 @@ impl<T> From<T> for MsgPack<T> {
     }
 }
 
+#[cfg(feature = "rmp_serde")]
 impl<T> IntoResponse for MsgPack<T>
 where
-    T: Serialize,
+    T: serde::Serialize,
 {
     fn into_response(self) -> Response {
         let bytes = match rmp_serde::encode::to_vec_named(&self.0) {
@@ -148,6 +191,24 @@ where
         };
 
         let mut res = bytes.into_response();
+
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/msgpack"),
+        );
+        res
+    }
+}
+
+#[cfg(feature = "msgpacker")]
+impl<T> IntoResponse for MsgPack<T>
+    where
+        T: msgpacker::Packable,
+{
+    fn into_response(self) -> Response {
+        let mut vec = Vec::new();
+        T::pack(&self, &mut vec);
+        let mut res = vec.into_response();
 
         res.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -234,10 +295,11 @@ where
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MsgPackRaw<T>(pub T);
 
+#[cfg(feature = "rmp_serde")]
 #[async_trait]
 impl<T, S> FromRequest<S> for MsgPackRaw<T>
 where
-    T: DeserializeOwned,
+    T: serde::de::DeserializeOwned,
     S: Send + Sync,
 {
     type Rejection = MsgPackRejection;
@@ -249,6 +311,25 @@ where
         let bytes = Bytes::from_request(req, state).await?;
         let value = rmp_serde::from_slice(&bytes).map_err(InvalidMsgPackBody::from_err)?;
         Ok(MsgPackRaw(value))
+    }
+}
+
+#[cfg(feature = "msgpacker")]
+#[async_trait]
+impl<T, S> FromRequest<S> for MsgPackRaw<T>
+    where
+        T: msgpacker::Unpackable,
+        S: Send + Sync,
+{
+    type Rejection = MsgPackRejection;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        if !message_pack_content_type(&req) {
+            return Err(MissingMsgPackContentType.into())
+        }
+        let bytes = Bytes::from_request(req, state).await?;
+        let value = wrap_error(T::unpack(&bytes)).map_err(InvalidMsgPackBody::from_err)?;
+        Ok(MsgPackRaw(value.1))
     }
 }
 
@@ -272,9 +353,10 @@ impl<T> From<T> for MsgPackRaw<T> {
     }
 }
 
+#[cfg(feature = "rmp_serde")]
 impl<T> IntoResponse for MsgPackRaw<T>
 where
-    T: Serialize,
+    T: serde::Serialize,
 {
     fn into_response(self) -> Response {
         let bytes = match rmp_serde::encode::to_vec(&self.0) {
@@ -289,6 +371,24 @@ where
         };
 
         let mut res = bytes.into_response();
+
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/msgpack"),
+        );
+        res
+    }
+}
+
+#[cfg(feature = "msgpacker")]
+impl<T> IntoResponse for MsgPackRaw<T>
+    where
+        T: msgpacker::Packable,
+{
+    fn into_response(self) -> Response {
+        let mut vec = Vec::new();
+        T::pack(&self.0, &mut vec);
+        let mut res = vec.into_response();
 
         res.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -318,7 +418,7 @@ fn message_pack_content_type<B>(req: &Request<B>) -> bool {
     is_message_pack
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rmp_serde"))]
 mod tests {
     use axum::{
         body::Body,
@@ -471,3 +571,156 @@ mod tests {
         buffer
     }
 }
+
+#[cfg(all(test, feature = "msgpacker"))]
+mod tests {
+    use axum::{
+        body::Body,
+        extract::FromRequest,
+        http::HeaderValue,
+        response::IntoResponse,
+    };
+    use futures_util::StreamExt;
+
+    use crate::{MsgPack, MsgPackRaw, MsgPackRejection};
+    use hyper::{header, Request};
+    use msgpacker::{MsgPacker, Packable};
+
+    #[derive(Debug, MsgPacker, PartialEq)]
+    struct Input {
+        foo: String,
+    }
+
+    fn into_request<T: Packable>(value: &T) -> Request<Body> {
+        let mut vec = Vec::new();
+        T::pack(&value, &mut vec);
+
+        let body = Body::from(vec);
+        Request::new(body)
+    }
+
+    fn into_request_raw<T: Packable>(value: &T) -> Request<Body> {
+        let mut vec = Vec::new();
+        T::pack(&value, &mut vec);
+
+        let body = Body::from(vec);
+        Request::new(body)
+    }
+
+    #[tokio::test]
+    async fn serializes_named() {
+        let input = crate::tests::Input { foo: "bar".into() };
+        let mut serialized = Vec::new();
+        Input::pack(&input, &mut serialized);
+
+        let body = MsgPack(input).into_response().into_body();
+        let bytes = crate::tests::to_bytes(body).await;
+
+        assert_eq!(serialized, bytes);
+    }
+
+    #[tokio::test]
+    async fn deserializes_named() {
+        let input = crate::tests::Input { foo: "bar".into() };
+        let mut request = crate::tests::into_request(&input);
+
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/msgpack"),
+        );
+
+        let outcome =
+            <MsgPack<crate::tests::Input> as FromRequest<_, _>>::from_request(request, &||{}).await;
+
+        let outcome = outcome.unwrap();
+        assert_eq!(input, outcome.0);
+    }
+
+    #[tokio::test]
+    async fn serializes_raw() {
+        let input = crate::tests::Input { foo: "bar".into() };
+        let mut serialized = Vec::new();
+        Input::pack(&input, &mut serialized);
+
+        let body = MsgPackRaw(input).into_response().into_body();
+        let bytes = crate::tests::to_bytes(body).await;
+
+        assert_eq!(serialized, bytes);
+    }
+
+    #[tokio::test]
+    async fn deserializes_raw() {
+        let input = crate::tests::Input { foo: "bar".into() };
+        let mut request = crate::tests::into_request_raw(&input);
+
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/msgpack"),
+        );
+
+        let outcome =
+            <MsgPackRaw<crate::tests::Input> as FromRequest<_, _>>::from_request(request, &||{})
+                .await;
+
+        let outcome = outcome.unwrap();
+        assert_eq!(input, outcome.0);
+    }
+
+    #[tokio::test]
+    async fn supported_content_type() {
+        let input = crate::tests::Input { foo: "bar".into() };
+        let mut request = crate::tests::into_request(&input);
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/msgpack"),
+        );
+
+        let outcome =
+            <MsgPack<crate::tests::Input> as FromRequest<_, _>>::from_request(request, &||{}).await;
+        assert!(outcome.is_ok());
+
+        let mut request = crate::tests::into_request(&input);
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/cloudevents+msgpack"),
+        );
+
+        let outcome =
+            <MsgPack<crate::tests::Input> as FromRequest<_, _>>::from_request(request, &||{}).await;
+        assert!(outcome.is_ok());
+
+        let mut request = crate::tests::into_request(&input);
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-msgpack"),
+        );
+
+        let outcome =
+            <MsgPack<crate::tests::Input> as FromRequest<_, _>>::from_request(request, &||{}).await;
+        assert!(outcome.is_ok());
+
+        let request = crate::tests::into_request(&input);
+        let outcome =
+            <MsgPack<crate::tests::Input> as FromRequest<_, _>>::from_request(request, &||{}).await;
+
+        match outcome {
+            Err(MsgPackRejection::MissingMsgPackContentType(_)) => {}
+            other => unreachable!(
+                "Expected missing MsgPack content type rejection, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    async fn to_bytes(body: Body) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut stream = body.into_data_stream();
+
+        while let Some(bytes) = stream.next().await {
+            buffer.extend(bytes.unwrap().into_iter());
+        }
+
+        buffer
+    }
+}
+
